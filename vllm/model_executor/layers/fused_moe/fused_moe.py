@@ -15,6 +15,8 @@ from vllm.logger import init_logger
 # yapf: disable
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig, get_config_quant_dtype)
+from vllm.model_executor.layers.quantization.utils.int8_utils import (
+    per_token_group_quant_int8)
 from vllm.model_executor.layers.fused_moe.cutlass_moe import (
     _valid_cutlass_block_scaled_grouped_gemm,
     run_cutlass_block_scaled_fused_experts)
@@ -498,13 +500,23 @@ def invoke_fused_moe_kernel(A: torch.Tensor,
     assert topk_weights is None or topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
-    if use_fp8_w8a8 or use_int8_w8a8:
+    if use_fp8_w8a8:
         assert B_scale is not None
         assert (block_shape is None
                 or triton.cdiv(B.size(-2), block_shape[0]) == B_scale.size(-2))
         assert (block_shape is None
                 or triton.cdiv(B.size(-1), block_shape[1]) == B_scale.size(-1))
-
+    elif use_int8_w8a8:
+        assert B_scale is not None
+        if block_shape is None:
+            A, A_scale = ops.scaled_int8_quant(A, A_scale)
+        else:
+            assert len(block_shape) == 2
+            block_n, block_k = block_shape[0], block_shape[1]
+            A, A_scale = per_token_group_quant_int8(A, block_k)
+            assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
+            assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
+            assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
     elif use_int8_w8a16 or use_int4_w4a16:
         assert B_scale is not None
         assert block_shape is None or block_shape[0] == 0
@@ -655,7 +667,8 @@ def get_config_file_name(E: int,
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     block_shape_selector = ("" if not block_shape or not all(block_shape) else
                             f",block_shape={block_shape}").replace(" ", "")
-    return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}.json"  # noqa: E501
+    # return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}.json"  # noqa: E501
+    return "W7900.json"
 
 
 # Adapted from: https://github.com/sgl-project/sglang/pull/2628
@@ -979,9 +992,12 @@ def get_config_dtype_str(
         use_int4_w4a16: Optional[bool] = False,
         use_int8_w8a16: Optional[bool] = False,
         use_fp8_w8a8: Optional[bool] = False,
+        use_int8_w8a8: Optional[bool] = False,
         use_mxfp4_w4a4: Optional[bool] = False) -> Optional[str]:
     if use_fp8_w8a8:
         return "fp8_w8a8"
+    elif use_int8_w8a8:
+        return "int8_w8a8"
     elif use_int8_w8a16:
         return "int8_w8a16"
     elif use_int4_w4a16:
@@ -1392,6 +1408,7 @@ def fused_experts_impl(
     M = min(num_tokens, CHUNK_SIZE)
     config_dtype = get_config_dtype_str(use_fp8_w8a8=use_fp8_w8a8,
                                         use_int8_w8a16=use_int8_w8a16,
+                                        use_int8_w8a8=use_int8_w8a8,
                                         use_int4_w4a16=use_int4_w4a16,
                                         use_mxfp4_w4a4=use_mxfp4_w4a4,
                                         dtype=hidden_states.dtype)
@@ -1773,6 +1790,7 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             global_num_experts = E
 
         config_dtype = get_config_dtype_str(use_fp8_w8a8=self.use_fp8_w8a8,
+                                            use_int8_w8a8=self.use_int8_w8a8,
                                             use_int8_w8a16=self.use_int8_w8a16,
                                             use_int4_w4a16=self.use_int4_w4a16,
                                             use_mxfp4_w4a4=self.use_mxfp4_w4a4,

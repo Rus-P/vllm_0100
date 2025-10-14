@@ -769,7 +769,10 @@ class FusedMoE(torch.nn.Module):
                     "CompressedTensorsWNA16MarlinMoEMethod",
                     "CompressedTensorsWNA16MoEMethod")):
             moe_quant_params["intermediate_size_full"] = intermediate_size
-
+        if (self.quant_method.__class__.__name__
+                in ("BlockInt8MoEMethod")):
+            # moe_quant_params["intermediate_size"] = intermediate_size
+            moe_quant_params["intermediate_size"] = self.intermediate_size_per_partition
         self.quant_method.create_weights(layer=self, **moe_quant_params)
         if isinstance(self.quant_method, FusedMoEMethodBase):
             self.quant_method.maybe_swap_experts_impl(self.moe_parallel_config)

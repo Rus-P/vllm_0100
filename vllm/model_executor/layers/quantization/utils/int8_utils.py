@@ -1,114 +1,62 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-# Adapted from https://github.com/sgl-project/sglang/blob/4cb53ecd0cffceb6dee5c011a58f65997a86f151/python/sglang/srt/layers/quantization/int8_kernel.py
+# Adapted from https://github.com/sgl-project/sglang/pull/3730
 import functools
 import json
 import logging
 import os
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+import triton
+import triton.language as tl
 
+# from sglang.srt.utils import get_device_name
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
 
 logger = logging.getLogger(__name__)
 
+_PRELOADED_W8A8_CONFIGS = {}
 
-def apply_w8a8_block_int8_linear(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    block_size: list[int],
-    weight_scale: torch.Tensor,
-    input_scale: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    assert input_scale is None
-    # View input as 2D matrix for fp8 methods
-    input_2d = input.view(-1, input.shape[-1])
-    output_shape = [*input.shape[:-1], weight.shape[0]]
+def _preload_w8a8_block_int8_configs():
+    config_dir = os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), 
+        "configs" 
+    )
+    
+    if not os.path.isdir(config_dir):
+        logger.warning(f"W8A8 Block INT8 configs not in: {config_dir}, using default")
+        return
+    
+    try:
+        json_files = [
+            f for f in os.listdir(config_dir) 
+            if f.endswith(".json") and "W7900" in f
+        ]
+        logger.info(f"========== found {len(json_files)} tuned configs ==========")
+    except OSError as e:
+        logger.error(f"loading configs from {config_dir} failed: {e}, using default config")
+        return
+    
+    if not json_files:
+        logger.warning(f"using default configs...")
+        return
+    
+    for json_file in json_files:
+        if "dtype=int8_w8a8" not in json_file:
+            continue
+        json_path = os.path.join(config_dir, json_file)
+        try:
+            with open(json_path, "r") as f:
+                config_content = json.load(f)
+            config_content = {int(key): val for key, val in config_content.items()}
+            _PRELOADED_W8A8_CONFIGS[json_file] = config_content
+            logger.debug(f"preload W8A8 configs:{json_file}")
+        except Exception as e:
+            logger.error(f"解析配置文件 {json_path} 失败：{e}，跳过该文件")
 
-    q_input, x_scale = per_token_group_quant_int8(input_2d, block_size[1])
-    output = w8a8_block_int8_matmul(q_input,
-                                    weight,
-                                    x_scale,
-                                    weight_scale,
-                                    block_size,
-                                    output_dtype=input.dtype)
+_preload_w8a8_block_int8_configs()
 
-    if bias is not None:
-        output = output + bias
-    return output.to(dtype=input.dtype).view(*output_shape)
-
-
-def input_to_int8(
-        x: torch.Tensor,
-        dtype: torch.dtype = torch.int8) -> tuple[torch.Tensor, torch.Tensor]:
-    """This function quantizes input values to int8 values with
-    tensor-wise quantization."""
-    iinfo = torch.iinfo(dtype)
-    min_val, max_val = x.aminmax()
-    amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
-    int8_min, int8_max = iinfo.min, iinfo.max
-    scale = int8_max / amax
-    x_scl_sat = (x * scale).clamp(min=int8_min, max=int8_max)
-    return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
-
-
-def block_dequant(
-    x_q_block: torch.Tensor,
-    x_s: torch.Tensor,
-    block_size: list[int],
-) -> torch.Tensor:
-    """This function conducts block-wise dequantization.
-    The inputs are block-wise quantization tensor `x_q_block`,
-    block-wise quantization scale and the block size.
-    The outputs are dequantized tensor.
-    """
-    block_n, block_k = block_size[0], block_size[1]
-    n, k = x_q_block.shape
-    n_tiles = (n + block_n - 1) // block_n
-    k_tiles = (k + block_k - 1) // block_k
-    assert n_tiles == x_s.shape[0]
-    assert k_tiles == x_s.shape[1]
-
-    x_dq_block = x_q_block.to(torch.float32)
-
-    for i in range(k_tiles):
-        for j in range(n_tiles):
-            x_dq_block[
-                j * block_n:min((j + 1) * block_n, n),
-                i * block_k:min((i + 1) * block_k, k),
-            ] *= x_s[j][i]
-
-    return x_dq_block
-
-
-if current_platform.is_rocm():
-    from triton.language import core
-
-    # NOTE: This can be removed when hip.libdevice.round() is available.
-    @core.extern
-    def round_f32(arg0, _builder=None):
-        return core.extern_elementwise("",
-                                       "", [arg0], {
-                                           (core.dtype("fp32"), ):
-                                           ("llvm.round", core.dtype("fp32")),
-                                           (core.dtype("fp64"), ):
-                                           ("llvm.round", core.dtype("fp64")),
-                                       },
-                                       is_pure=True,
-                                       _builder=_builder)
-
-    @triton.jit
-    def round_int8(x):
-        return round_f32(x).to(tl.int8)
-else:
-
-    @triton.jit
-    def round_int8(x):
-        return tl.extra.cuda.libdevice.round(x).to(tl.int8)
 
 
 @triton.jit
@@ -121,18 +69,17 @@ def _per_token_quant_int8(
     N,
     BLOCK: tl.constexpr,
 ):
-    # Adapted from https://github.com/InternLM/lmdeploy/blob/086481ed84b59bee3b8e4274e5fc69620040c048/lmdeploy/pytorch/kernels/cuda/w8a8_triton_kernels.py#L282
     row_id = tl.program_id(0)
 
     cols = tl.arange(0, BLOCK)
     mask = cols < N
 
-    x = tl.load(x_ptr + row_id * stride_x + cols, mask=mask,
-                other=0.0).to(tl.float32)
+    x = tl.load(x_ptr + row_id * stride_x + cols,
+                mask=mask, other=0.0).to(tl.float32)
     absmax = tl.maximum(tl.max(tl.abs(x)), 1e-10)
     scale_x = absmax / 127
     x_q = x * (127 / absmax)
-    x_q = round_int8(x_q)
+    x_q = tl.extra.cuda.libdevice.round(x_q).to(tl.int8)
 
     tl.store(xq_ptr + row_id * stride_xq + cols, x_q, mask=mask)
     tl.store(scale_ptr + row_id, scale_x)
@@ -142,15 +89,14 @@ def per_token_quant_int8(x):
     M = x.numel() // x.shape[-1]
     N = x.shape[-1]
     x_q = torch.empty_like(x, device=x.device, dtype=torch.int8)
-    scales = torch.empty(x.shape[:-1] + (1, ),
-                         device=x.device,
-                         dtype=torch.float32)
+    scales = torch.empty(x.shape[:-1] + (1,),
+                         device=x.device, dtype=torch.float32)
     BLOCK = triton.next_power_of_2(N)
     # heuristics for number of warps
     num_warps = min(max(BLOCK // 256, 1), 8)
 
     assert x.is_contiguous()
-    _per_token_quant_int8[(M, )](
+    _per_token_quant_int8[(M,)](
         x,
         x_q,
         scales,
@@ -173,7 +119,7 @@ def _per_token_group_quant_int8(
     y_s_ptr,
     # Stride of input
     y_stride,
-    # Columns of input
+    # Collums of input
     N,
     # Avoid to divide zero
     eps,
@@ -183,8 +129,8 @@ def _per_token_group_quant_int8(
     # Meta-parameters
     BLOCK: tl.constexpr,
 ):
-    """A Triton-accelerated function to perform per-token-group
-    quantization on a tensor.
+    """A Triton-accelerated function to perform
+    per-token-group quantization on a tensor.
 
     This function converts the tensor values into int8 values.
     """
@@ -212,25 +158,26 @@ def per_token_group_quant_int8(
     group_size: int,
     eps: float = 1e-10,
     dtype: torch.dtype = torch.int8,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Function to perform per-token-group quantization on an input tensor `x`.
 
     It converts the tensor values into signed int8 values and returns the
     quantized tensor along with the scaling factor used for quantization.
 
     Args:
-        x: The input tensor with ndim >= 2.
+        x: The input tenosr with ndim >= 2.
         group_size: The group size used for quantization.
         eps: The minimum to avoid dividing zero.
         dtype: The dype of output tensor. Note that only `torch.int8`
-            is supported for now.
+        is supported for now.
 
     Returns:
-        tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the
-            scaling factor for quantization.
+        Tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the
+        scaling factor for quantization.
     """
-    assert (x.shape[-1] % group_size == 0
-            ), "the last dimension of `x` cannot be divisible by `group_size`"
+    assert (
+        x.shape[-1] % group_size == 0
+    ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
     iinfo = torch.iinfo(dtype)
@@ -241,7 +188,7 @@ def per_token_group_quant_int8(
     M = x.numel() // group_size
     N = group_size
     x_s = torch.empty(
-        x.shape[:-1] + (x.shape[-1] // group_size, ),
+        x.shape[:-1] + (x.shape[-1] // group_size,),
         device=x.device,
         dtype=torch.float32,
     )
@@ -250,7 +197,7 @@ def per_token_group_quant_int8(
     # heuristics for number of warps
     num_warps = min(max(BLOCK // 256, 1), 8)
     num_stages = 1
-    _per_token_group_quant_int8[(M, )](
+    _per_token_group_quant_int8[(M,)](
         x,
         x_q,
         x_s,
@@ -300,8 +247,8 @@ def _w8a8_block_int8_matmul(
     GROUP_SIZE_M: tl.constexpr,
 ):
     """Triton-accelerated function used to perform linear operations (dot
-    product) on input tensors `A` and `B` with block-wise quantization, and
-    store the result in output tensor `C`.
+    product) on input tensors `A` and `B` with block-wise quantization,
+    and store the result in output tensor `C`.
     """
 
     pid = tl.program_id(axis=0)
@@ -338,8 +285,7 @@ def _w8a8_block_int8_matmul(
         a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
         b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
 
-        accumulator += tl.dot(a, b).to(tl.float32) * a_s[:,
-                                                         None] * b_s[None, :]
+        accumulator += tl.dot(a, b).to(tl.float32) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
@@ -356,10 +302,10 @@ def _w8a8_block_int8_matmul(
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
 
-
 @functools.lru_cache
-def get_w8a8_block_int8_configs(N: int, K: int, block_n: int,
-                                block_k: int) -> Optional[dict[int, Any]]:
+def get_w8a8_block_int8_configs(
+    N: int, K: int, block_n: int, block_k: int
+) -> Optional[Dict[int, Any]]:
     """
     Return optimized configurations for the w8a8 block fp8 kernel.
 
@@ -371,27 +317,21 @@ def get_w8a8_block_int8_configs(N: int, K: int, block_n: int,
 
     # First look up if an optimized configuration is available in the configs
     # directory
-    device_name = current_platform.get_device_name().replace(" ", "_")
+    device_name = "W7900"
     json_file_name = f"N={N},K={K},device_name={device_name},dtype=int8_w8a8,block_shape=[{block_n}, {block_k}].json"  # noqa: E501
 
-    config_file_path = os.path.join(
-        os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name)
-    if os.path.exists(config_file_path):
-        with open(config_file_path) as f:
-            logger.info(
-                "Using configuration from %s for W8A8 Block INT8 kernel.",
-                config_file_path,
-            )
-            # If a configuration has been found, return it
-            return {int(key): val for key, val in json.load(f).items()}
+    if json_file_name in _PRELOADED_W8A8_CONFIGS:
+        # logger.info(
+        #     "Using preloaded configuration for W8A8 Block INT8 kernel: %s",
+        #     json_file_name,
+        # )
+        return _PRELOADED_W8A8_CONFIGS[json_file_name]
 
-    # If no optimized configuration is available, we will use the default
-    # configuration
-    logger.warning(
-        ("Using default W8A8 Block INT8 kernel config. Performance might "
-         "be sub-optimal! Config file not found at %s"),
-        config_file_path,
-    )
+    # logger.warning(
+    #     ("Using default W8A8 Block INT8 kernel config. Performance might "
+    #      "be sub-optimal! No preloaded config found for: %s"),
+    #     json_file_name,
+    # )
     return None
 
 
@@ -400,11 +340,11 @@ def w8a8_block_int8_matmul(
     B: torch.Tensor,
     As: torch.Tensor,
     Bs: torch.Tensor,
-    block_size: list[int],
+    block_size: List[int],
     output_dtype: torch.dtype = torch.float16,
+    preselected_config: Dict[str, int] = None,  # 新增：接收预生成的配置
 ) -> torch.Tensor:
-    """This function performs matrix multiplication with block-wise
-    quantization.
+    """matrix multiplication with block-wise quantization.
 
     It takes two input tensors `A` and `B` with scales `As` and `Bs`.
     The output is returned in the specified `output_dtype`.
@@ -414,8 +354,8 @@ def w8a8_block_int8_matmul(
         B: The input tensor, e.g., weight.
         As: The per-token-group quantization scale for `A`.
         Bs: The per-block quantization scale for `B`.
-        block_size: The block size for per-block quantization. It should be
-            2-dim, e.g., [128, 128].
+        block_size: The block size for per-block quantization. It should
+        be 2-dim, e.g., [128, 128].
         output_dytpe: The dtype of the returned tensor.
 
     Returns:
@@ -434,29 +374,29 @@ def w8a8_block_int8_matmul(
     assert triton.cdiv(N, block_n) == Bs.shape[0]
     assert triton.cdiv(K, block_k) == Bs.shape[1]
 
-    C_shape = A.shape[:-1] + (N, )
+    C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
 
-    configs = get_w8a8_block_int8_configs(N, K, block_size[0], block_size[1])
-    if configs:
-        # If an optimal configuration map has been found, look up the
-        # optimal config
-        config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
+    # --- 关键修改：直接使用传入的预生成配置，无任何动态计算 ---
+    if preselected_config is not None:
+        config = preselected_config
+        logger.debug(f"Using preselected config for M={M}: {config}")
     else:
-        # Default config
-        # Block-wise quant: BLOCK_SIZE_K must be divisible by block_size[1]
+        #  fallback到默认配置（理论上不会走到这里）
         config = {
             "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": block_size[0],
-            "BLOCK_SIZE_K": block_size[1],
+            "BLOCK_SIZE_N": block_n,
+            "BLOCK_SIZE_K": block_k,
             "GROUP_SIZE_M": 32,
             "num_warps": 4,
             "num_stages": 3,
         }
-
+    
     def grid(META):
-        return (triton.cdiv(M, META["BLOCK_SIZE_M"]) *
-                triton.cdiv(N, META["BLOCK_SIZE_N"]), )
+        return (
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) *
+            triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
 
     _w8a8_block_int8_matmul[grid](
         A,
@@ -483,3 +423,74 @@ def w8a8_block_int8_matmul(
     )
 
     return C
+
+
+def apply_w8a8_block_int8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    preselected_config: Dict[str, int] = None,  # 新增：接收配置
+) -> torch.Tensor:
+    assert input_scale is None
+    # View input as 2D matrix for fp8 methods
+    input_2d = input.view(-1, input.shape[-1])
+    output_shape = [*input.shape[:-1], weight.shape[0]]
+
+    q_input, x_scale = per_token_group_quant_int8(input_2d, block_size[1])
+    # 传递预生成的配置给 matmul
+    output = w8a8_block_int8_matmul(
+        q_input, weight, x_scale, weight_scale, block_size,
+        output_dtype=input.dtype,
+        preselected_config=preselected_config  # 新增：传递配置
+    )
+
+    if bias is not None:
+        output = output + bias
+    return output.to(dtype=input.dtype).view(*output_shape)
+
+
+def input_to_int8(
+    x: torch.Tensor, dtype: torch.dtype = torch.int8
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """This function quantizes input values to
+    int8 values with tensor-wise quantization.
+    """
+    iinfo = torch.iinfo(dtype)
+    min_val, max_val = x.aminmax()
+    amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
+    int8_min, int8_max = iinfo.min, iinfo.max
+    scale = int8_max / amax
+    x_scl_sat = (x * scale).clamp(min=int8_min, max=int8_max)
+    return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
+
+
+def block_dequant(
+    x_q_block: torch.Tensor,
+    x_s: torch.Tensor,
+    block_size: List[int],
+) -> torch.Tensor:
+    """This function conducts block-wise dequantization.
+    The inputs are block-wise quantization tensor `x_q_block`,
+    block-wise quantization scale and the block size.
+    The outputs are dequantized tensor.
+    """
+    block_n, block_k = block_size[0], block_size[1]
+    n, k = x_q_block.shape
+    n_tiles = (n + block_n - 1) // block_n
+    k_tiles = (k + block_k - 1) // block_k
+    assert n_tiles == x_s.shape[0]
+    assert k_tiles == x_s.shape[1]
+
+    x_dq_block = x_q_block.to(torch.float32)
+
+    for i in range(k_tiles):
+        for j in range(n_tiles):
+            x_dq_block[
+                j * block_n : min((j + 1) * block_n, n),
+                i * block_k : min((i + 1) * block_k, k),
+            ] *= x_s[j][i]
+
+    return x_dq_block
