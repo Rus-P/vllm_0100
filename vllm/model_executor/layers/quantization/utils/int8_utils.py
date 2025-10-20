@@ -10,54 +10,53 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+from vllm.utils import direct_register_custom_op
 
 # from sglang.srt.utils import get_device_name
 from vllm.platforms import current_platform
 
 logger = logging.getLogger(__name__)
 
-_PRELOADED_W8A8_CONFIGS = {}
+# _PRELOADED_W8A8_CONFIGS = {}
 
-def _preload_w8a8_block_int8_configs():
-    config_dir = os.path.join(
-        os.path.dirname(os.path.realpath(__file__)), 
-        "configs" 
-    )
+# def _preload_w8a8_block_int8_configs():
+#     config_dir = os.path.join(
+#         os.path.dirname(os.path.realpath(__file__)), 
+#         "configs" 
+#     )
     
-    if not os.path.isdir(config_dir):
-        logger.warning(f"W8A8 Block INT8 configs not in: {config_dir}, using default")
-        return
+#     if not os.path.isdir(config_dir):
+#         logger.warning(f"W8A8 Block INT8 configs not in: {config_dir}, using default")
+#         return
     
-    try:
-        json_files = [
-            f for f in os.listdir(config_dir) 
-            if f.endswith(".json") and "W7900" in f
-        ]
-        logger.info(f"========== found {len(json_files)} tuned configs ==========")
-    except OSError as e:
-        logger.error(f"loading configs from {config_dir} failed: {e}, using default config")
-        return
+#     try:
+#         json_files = [
+#             f for f in os.listdir(config_dir) 
+#             if f.endswith(".json") and "W7900" in f
+#         ]
+#         logger.info(f"========== found {len(json_files)} tuned configs ==========")
+#     except OSError as e:
+#         logger.error(f"loading configs from {config_dir} failed: {e}, using default config")
+#         return
     
-    if not json_files:
-        logger.warning(f"using default configs...")
-        return
+#     if not json_files:
+#         logger.warning(f"using default configs...")
+#         return
     
-    for json_file in json_files:
-        if "dtype=int8_w8a8" not in json_file:
-            continue
-        json_path = os.path.join(config_dir, json_file)
-        try:
-            with open(json_path, "r") as f:
-                config_content = json.load(f)
-            config_content = {int(key): val for key, val in config_content.items()}
-            _PRELOADED_W8A8_CONFIGS[json_file] = config_content
-            logger.debug(f"preload W8A8 configs:{json_file}")
-        except Exception as e:
-            logger.error(f"解析配置文件 {json_path} 失败：{e}，跳过该文件")
+#     for json_file in json_files:
+#         if "dtype=int8_w8a8" not in json_file:
+#             continue
+#         json_path = os.path.join(config_dir, json_file)
+#         try:
+#             with open(json_path, "r") as f:
+#                 config_content = json.load(f)
+#             config_content = {int(key): val for key, val in config_content.items()}
+#             _PRELOADED_W8A8_CONFIGS[json_file] = config_content
+#             logger.info(f"preload W8A8 matmul config from :{json_path}")
+#         except Exception as e:
+#             logger.error(f"解析配置文件 {json_path} 失败：{e}，跳过该文件")
 
-_preload_w8a8_block_int8_configs()
-
-
+# _preload_w8a8_block_int8_configs()
 
 @triton.jit
 def _per_token_quant_int8(
@@ -213,7 +212,6 @@ def per_token_group_quant_int8(
 
     return x_q, x_s
 
-
 @triton.jit
 def _w8a8_block_int8_matmul(
     # Pointers to inputs and output
@@ -317,32 +315,40 @@ def get_w8a8_block_int8_configs(
 
     # First look up if an optimized configuration is available in the configs
     # directory
+    # device_name = current_platform.get_device_name().replace(" ", "_")
     device_name = "W7900"
-    json_file_name = f"N={N},K={K},device_name={device_name},dtype=int8_w8a8,block_shape=[{block_n}, {block_k}].json"  # noqa: E501
+    json_file_name = f"N={N},K={K},device_name={device_name},dtype=int8_w8a8,block_shape=[{block_n},{block_k}].json" # noqa: E501
 
-    if json_file_name in _PRELOADED_W8A8_CONFIGS:
-        # logger.info(
-        #     "Using preloaded configuration for W8A8 Block INT8 kernel: %s",
-        #     json_file_name,
-        # )
-        return _PRELOADED_W8A8_CONFIGS[json_file_name]
+    config_file_path = os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
+    )
+    if os.path.exists(config_file_path):
+        with open(config_file_path) as f:
+            logger.info(
+                "Using configuration from %s for W8A8 Block INT8 kernel.",
+                config_file_path,
+            )
+            # If a configuration has been found, return it
+            return {int(key): val for key, val in json.load(f).items()}
 
-    # logger.warning(
-    #     ("Using default W8A8 Block INT8 kernel config. Performance might "
-    #      "be sub-optimal! No preloaded config found for: %s"),
-    #     json_file_name,
-    # )
+    # If no optimized configuration is available, we will use the default
+    # configuration
+    logger.warning(
+        (
+            "Using default W8A8 Block INT8 kernel config. Performance might "
+            "be sub-optimal! Config file not found at %s"
+        ),
+        config_file_path,
+    )
     return None
 
-
-def w8a8_block_int8_matmul(
+def w8a8_block_int8_matmul_impl(
     A: torch.Tensor,
     B: torch.Tensor,
     As: torch.Tensor,
     Bs: torch.Tensor,
     block_size: List[int],
     output_dtype: torch.dtype = torch.float16,
-    preselected_config: Dict[str, int] = None,  # 新增：接收预生成的配置
 ) -> torch.Tensor:
     """matrix multiplication with block-wise quantization.
 
@@ -377,21 +383,20 @@ def w8a8_block_int8_matmul(
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
 
-    # --- 关键修改：直接使用传入的预生成配置，无任何动态计算 ---
-    if preselected_config is not None:
-        config = preselected_config
-        logger.debug(f"Using preselected config for M={M}: {config}")
+    configs = get_w8a8_block_int8_configs(N, K, block_size[0], block_size[1])
+    if configs:
+        config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
     else:
-        #  fallback到默认配置（理论上不会走到这里）
+        # Default config
         config = {
             "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": block_n,
-            "BLOCK_SIZE_K": block_k,
+            "BLOCK_SIZE_N": block_size[0],
+            "BLOCK_SIZE_K": block_size[1],
             "GROUP_SIZE_M": 32,
             "num_warps": 4,
             "num_stages": 3,
         }
-    
+
     def grid(META):
         return (
             triton.cdiv(M, META["BLOCK_SIZE_M"]) *
@@ -419,11 +424,30 @@ def w8a8_block_int8_matmul(
         As.stride(-1),
         Bs.stride(1),
         Bs.stride(0),
-        **config,
+        **config
     )
 
     return C
 
+def w8a8_block_int8_matmul_fake(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size: List[int],
+    output_dtype: torch.dtype = torch.float16,
+    preselected_config: Dict[str, int] = None,
+) -> torch.Tensor:
+    N = B.shape[0]
+    output_shape = (*A.shape[:-1], N)
+    return A.new_empty(output_shape, dtype=output_dtype)
+
+direct_register_custom_op(
+    op_name="w8a8_block_int8_matmul",  
+    op_func=w8a8_block_int8_matmul_impl,  
+    fake_impl=w8a8_block_int8_matmul_fake,  
+    mutates_args=[],  
+)
 
 def apply_w8a8_block_int8_linear(
     input: torch.Tensor,
@@ -432,7 +456,6 @@ def apply_w8a8_block_int8_linear(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
-    preselected_config: Dict[str, int] = None,  # 新增：接收配置
 ) -> torch.Tensor:
     assert input_scale is None
     # View input as 2D matrix for fp8 methods
@@ -440,11 +463,9 @@ def apply_w8a8_block_int8_linear(
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
     q_input, x_scale = per_token_group_quant_int8(input_2d, block_size[1])
-    # 传递预生成的配置给 matmul
-    output = w8a8_block_int8_matmul(
+    output = torch.ops.vllm.w8a8_block_int8_matmul(
         q_input, weight, x_scale, weight_scale, block_size,
-        output_dtype=input.dtype,
-        preselected_config=preselected_config  # 新增：传递配置
+        output_dtype=input.dtype
     )
 
     if bias is not None:
